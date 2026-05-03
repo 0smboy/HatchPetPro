@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hatch Pet"
+  short_description: "Fast Codex pet spritesheets from one built-in image_gen atlas"
+  default_prompt: "Hatch a Codex-compatible animated pet from a concept, reference images, or both. Use the fast built-in image_gen workflow by default: prepare a one-shot spritesheet prompt, call Codex built-in image_gen exactly once without OPENAI_API_KEY, record the selected generated_images ig_*.png source, normalize it into a 1536x1872 8x9 spritesheet, validate it, and package pet.json plus spritesheet.webp under ${CODEX_HOME:-$HOME/.codex}/pets/<pet-name>/. Do not use CLI/API-key, subagents, or row-by-row generation unless I explicitly ask for the slower workflow."
