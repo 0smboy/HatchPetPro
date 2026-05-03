@@ -68,7 +68,7 @@ python "$SKILL_DIR/scripts/finalize_fast_pet_run.py" \
   --force
 ```
 
-This slices the generated atlas as an 8x9 grid, keeps only valid used slots, fits used slots into `192x208`, leaves unused cells transparent, writes `final/spritesheet.webp`, validates it, creates `qa/contact-sheet.png`, and packages `pet.json` plus `spritesheet.webp`.
+This defaults to automatic normalization. It first detects the actual sprite rows and frame blobs, removes edge-connected flat/checkerboard-like backgrounds, fits detected sprites into `192x208` cells, duplicates the nearest same-row frame when the generator leaves a required final frame blank, leaves unused cells transparent, writes `final/spritesheet.webp`, validates it, creates `qa/contact-sheet.png`, and packages `pet.json` plus `spritesheet.webp`. If detection cannot produce a valid atlas, it falls back to proportional 8x9 grid slicing.
 
 ## Time Budget
 
@@ -83,14 +83,16 @@ Generate a clean pixel-art sprite sheet of one consistent character.
 If reference images are provided, use them as the character and style reference.
 Otherwise use this description: <character description>.
 
-No UI, labels, text, numbers, cards, borders, frame guides, shadows, scenery, or watermarks.
+No UI, labels, text, numbers, cards, borders, frame guides, separators, checkerboard pattern, shadows, scenery, or watermarks.
 Create exactly 9 action rows in this order with these frame counts:
 Idle x6, Run right x8, Run left x8, Waving x4, Jumping x5, Failed x8,
 Waiting x6, Running x6, Review x6.
 
-Arrange the whole image as one 8 column x 9 row sprite-sheet grid.
-Each row uses the listed frame count from left to right; cells after the last used frame must be empty.
-Use a transparent background if supported; otherwise use one perfectly flat removable solid-color background.
+Use an invisible 8 column x 9 row layout, not a drawn grid. Do not draw cell boxes, grid lines, row labels, column labels, gutters, dividers, or guide marks.
+Create all 57 required pet drawings. Do not leave any required frame blank, especially the final used frame in each row.
+Each row uses the listed frame count from left to right; positions after the last used frame must be completely empty.
+Keep each full-body pose separated, centered, and fully inside its slot with a little breathing room.
+Use a transparent background if supported; otherwise use one perfectly flat removable solid-color background that does not appear in the character. Never use a checkerboard transparency preview.
 Keep the same character proportions, outfit, face, palette, outline, and pixel-art style across all frames.
 ```
 
@@ -111,9 +113,10 @@ Before calling the pet done:
 - `${CODEX_HOME:-$HOME/.codex}/pets/<pet-id>/pet.json` exists.
 - `${CODEX_HOME:-$HOME/.codex}/pets/<pet-id>/spritesheet.webp` exists.
 - `final/validation.json` reports `ok: true`.
+- `qa/detect-normalization-report.json` or `qa/grid-normalization-report.json` records which normalization path produced the final atlas.
 - Inspect `qa/contact-sheet.png` for obvious identity drift, labels, visible grids, or non-transparent unused cells.
 
-If the single generated atlas is invalid or visually bad, regenerate one full atlas with a tighter prompt. Do not fall back to subagents or row-by-row generation unless the user explicitly chooses the slower workflow.
+If automatic normalization still leaves the contact sheet visually bad, regenerate one full atlas with a tighter prompt. Do not fall back to subagents or row-by-row generation unless the user explicitly chooses the slower workflow.
 
 ## Fallbacks
 

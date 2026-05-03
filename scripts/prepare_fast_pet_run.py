@@ -61,16 +61,18 @@ def build_prompt(description: str, references: list[Path], style_notes: str) -> 
     return f"""Generate a clean pixel-art sprite sheet of one consistent character.
 {reference_line}
 
-No UI, labels, text, numbers, cards, borders, frame guides, shadows, scenery, or watermarks.
+No UI, labels, text, numbers, cards, borders, frame guides, separators, checkerboard pattern, shadows, scenery, or watermarks.
 Create exactly 9 action rows in this order with these frame counts:
 Idle x6, Run right x8, Run left x8, Waving x4, Jumping x5, Failed x8,
 Waiting x6, Running x6, Review x6.
 
-Arrange the whole image as one 8 column x 9 row sprite-sheet grid.
-Each row uses the listed frame count from left to right; cells after the last used frame must be empty.
+This is an invisible 8 column x 9 row layout, not a drawn grid.
+Do not draw cell boxes, grid lines, row labels, column labels, gutters, dividers, or guide marks.
+Create all 57 required pet drawings. Do not leave any required frame blank, especially the final used frame in each row.
+Each row uses the listed frame count from left to right; positions after the last used frame must be completely empty.
 Keep the same character proportions, outfit, face, palette, outline, and pixel-art style across all frames.
-Use a transparent background if supported; otherwise use one perfectly flat removable solid-color background that does not appear in the character.
-Keep poses separated and centered.
+Use a transparent background if supported; otherwise use one perfectly flat removable solid-color background that does not appear in the character. Never use a checkerboard transparency preview.
+Keep each full-body pose separated, centered, and fully inside its slot with a little breathing room. Do not crop heads, feet, weapons, ears, tails, or accessories.
 Use compact Codex digital pet style: chunky readable silhouette, thick dark outline, flat pixel-art/cel shading, simple expressive face, tiny limbs.
 Avoid polished illustration, 3D rendering, soft gradients, complex tiny accessories, shadows, glows, motion trails, speed lines, wave marks, loose sparkles, text, labels, UI, grids, and scenery.
 Waving is paw pose only. Jumping is body position only. Running rows use limbs only. Review uses focus/lean/eyes/head tilt only.{extra_style}

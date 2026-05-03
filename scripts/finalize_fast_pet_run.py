@@ -35,7 +35,7 @@ ROW_SPECS = [
 
 
 def run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    print("+ " + " ".join(command))
+    print("+ " + " ".join(command), flush=True)
     return subprocess.run(command, check=check, text=True)
 
 
@@ -51,10 +51,21 @@ def color_distance(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
 
 
-def alpha_has_transparency(image: Image.Image) -> bool:
-    alpha = image.getchannel("A")
-    extrema = alpha.getextrema()
-    return bool(extrema and extrema[0] < 255)
+def edge_has_visible_background(image: Image.Image) -> bool:
+    rgba = image.convert("RGBA")
+    width, height = rgba.size
+    if width == 0 or height == 0:
+        return False
+    pixels = rgba.load()
+    return any(
+        pixels[x, y][3] > 0
+        for x, y in (
+            (0, 0),
+            (width - 1, 0),
+            (0, height - 1),
+            (width - 1, height - 1),
+        )
+    )
 
 
 def remove_edge_connected_background(image: Image.Image, threshold: float) -> Image.Image:
@@ -139,12 +150,20 @@ def fit_to_cell(image: Image.Image) -> Image.Image:
     return target
 
 
-def normalize_source_atlas(source_path: Path, *, background_threshold: float) -> Image.Image:
+class NormalizationError(RuntimeError):
+    """Raised when a source atlas cannot be normalized with a chosen strategy."""
+
+
+def normalize_grid_source_atlas(
+    source_path: Path, *, background_threshold: float
+) -> tuple[Image.Image, dict[str, object]]:
     with Image.open(source_path) as opened:
         source = opened.convert("RGBA")
 
-    if not alpha_has_transparency(source):
+    removed_edge_background = False
+    if edge_has_visible_background(source):
         source = remove_edge_connected_background(source, background_threshold)
+        removed_edge_background = True
 
     atlas = Image.new("RGBA", (ATLAS_WIDTH, ATLAS_HEIGHT), (0, 0, 0, 0))
     for _state, row, frame_count in ROW_SPECS:
@@ -156,7 +175,177 @@ def normalize_source_atlas(source_path: Path, *, background_threshold: float) ->
             cell = source.crop((left, top, right, bottom))
             fitted = fit_to_cell(cell)
             atlas.alpha_composite(fitted, (column * CELL_WIDTH, row * CELL_HEIGHT))
-    return atlas
+    return atlas, {
+        "ok": True,
+        "method": "grid",
+        "background_threshold": background_threshold,
+        "removed_edge_background": removed_edge_background,
+    }
+
+
+def projection_intervals(values: list[int], *, threshold: int, merge_gap: int) -> list[tuple[int, int]]:
+    intervals: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, value in enumerate(values):
+        if value > threshold and start is None:
+            start = index
+        elif value <= threshold and start is not None:
+            intervals.append((start, index))
+            start = None
+    if start is not None:
+        intervals.append((start, len(values)))
+
+    if not intervals:
+        return []
+
+    merged = [intervals[0]]
+    for start, end in intervals[1:]:
+        previous_start, previous_end = merged[-1]
+        if start - previous_end <= merge_gap:
+            merged[-1] = (previous_start, end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def alpha_projection_y(image: Image.Image) -> list[int]:
+    alpha = image.getchannel("A")
+    width, height = image.size
+    pixels = alpha.load()
+    return [sum(1 for x in range(width) if pixels[x, y] > 0) for y in range(height)]
+
+
+def alpha_projection_x(image: Image.Image, y0: int, y1: int) -> list[int]:
+    alpha = image.getchannel("A")
+    width, _height = image.size
+    pixels = alpha.load()
+    return [sum(1 for y in range(y0, y1) if pixels[x, y] > 0) for x in range(width)]
+
+
+def expand_interval(start: int, end: int, *, limit: int, padding: int) -> tuple[int, int]:
+    return max(0, start - padding), min(limit, end + padding)
+
+
+def ensure_frame_count(intervals: list[tuple[int, int]], frame_count: int) -> list[tuple[int, int]]:
+    if len(intervals) >= frame_count:
+        return intervals[:frame_count]
+    if not intervals:
+        raise NormalizationError("cannot duplicate frames from an empty detected interval list")
+    padded = list(intervals)
+    while len(padded) < frame_count:
+        padded.append(padded[-1])
+    return padded
+
+
+def parse_thresholds(value: str) -> list[int]:
+    thresholds = [int(part.strip()) for part in value.split(",") if part.strip()]
+    if not thresholds:
+        raise argparse.ArgumentTypeError("provide at least one threshold")
+    return sorted(set(thresholds))
+
+
+def choose_frame_intervals(
+    x_projection: list[int],
+    *,
+    frame_count: int,
+    thresholds: list[int],
+    merge_gap: int,
+) -> tuple[list[tuple[int, int]], int, int]:
+    candidates: list[tuple[int, int, int, list[tuple[int, int]]]] = []
+    for threshold in thresholds:
+        intervals = projection_intervals(x_projection, threshold=threshold, merge_gap=merge_gap)
+        intervals = [interval for interval in intervals if interval[1] - interval[0] > 8]
+        detected = len(intervals)
+        if detected == frame_count:
+            return intervals, detected, threshold
+        distance = abs(detected - frame_count)
+        below_penalty = 1 if detected < frame_count else 0
+        candidates.append((distance, below_penalty, threshold, intervals))
+
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    _distance, _below_penalty, threshold, intervals = candidates[0]
+    return intervals, len(intervals), threshold
+
+
+def normalize_detected_source_atlas(
+    source_path: Path,
+    *,
+    background_threshold: float,
+    row_threshold: int,
+    row_merge_gap: int,
+    x_thresholds: list[int],
+    x_merge_gap: int,
+    padding_x: int,
+    padding_y: int,
+) -> tuple[Image.Image, dict[str, object]]:
+    with Image.open(source_path) as opened:
+        source = opened.convert("RGBA")
+
+    removed_edge_background = False
+    if edge_has_visible_background(source):
+        source = remove_edge_connected_background(source, background_threshold)
+        removed_edge_background = True
+
+    y_projection = alpha_projection_y(source)
+    row_intervals = projection_intervals(
+        y_projection,
+        threshold=row_threshold,
+        merge_gap=row_merge_gap,
+    )
+    row_intervals = [interval for interval in row_intervals if interval[1] - interval[0] > 8]
+    if len(row_intervals) != ROWS:
+        raise NormalizationError(
+            f"expected {ROWS} detected sprite rows, found {len(row_intervals)}: {row_intervals}"
+        )
+
+    atlas = Image.new("RGBA", (ATLAS_WIDTH, ATLAS_HEIGHT), (0, 0, 0, 0))
+    rows_report: list[dict[str, object]] = []
+
+    for row_index, ((state, _row, frame_count), (row_start, row_end)) in enumerate(
+        zip(ROW_SPECS, row_intervals, strict=True)
+    ):
+        y0, y1 = expand_interval(row_start, row_end, limit=source.height, padding=padding_y)
+        x_projection = alpha_projection_x(source, y0, y1)
+        frame_intervals, detected_count, chosen_threshold = choose_frame_intervals(
+            x_projection,
+            frame_count=frame_count,
+            thresholds=x_thresholds,
+            merge_gap=x_merge_gap,
+        )
+        frame_intervals = ensure_frame_count(frame_intervals, frame_count)
+
+        for column, (frame_start, frame_end) in enumerate(frame_intervals):
+            x0, x1 = expand_interval(frame_start, frame_end, limit=source.width, padding=padding_x)
+            frame = source.crop((x0, y0, x1, y1))
+            fitted = fit_to_cell(frame)
+            atlas.alpha_composite(fitted, (column * CELL_WIDTH, row_index * CELL_HEIGHT))
+
+        rows_report.append(
+            {
+                "state": state,
+                "row": row_index,
+                "required": frame_count,
+                "detected": detected_count,
+                "duplicated": max(0, frame_count - detected_count),
+                "x_threshold": chosen_threshold,
+                "row_interval": [row_start, row_end],
+                "used_intervals": frame_intervals,
+            }
+        )
+
+    return atlas, {
+        "ok": True,
+        "method": "detect",
+        "background_threshold": background_threshold,
+        "removed_edge_background": removed_edge_background,
+        "row_threshold": row_threshold,
+        "row_merge_gap": row_merge_gap,
+        "x_thresholds": x_thresholds,
+        "x_merge_gap": x_merge_gap,
+        "padding_x": padding_x,
+        "padding_y": padding_y,
+        "rows": rows_report,
+    }
 
 
 def save_atlas(atlas: Image.Image, png_path: Path, webp_path: Path) -> None:
@@ -172,6 +361,23 @@ def main() -> None:
     parser.add_argument("--source-atlas", default="")
     parser.add_argument("--package-dir", default="")
     parser.add_argument("--background-threshold", type=float, default=32.0)
+    parser.add_argument(
+        "--normalization",
+        choices=("auto", "detect", "grid"),
+        default="auto",
+        help="auto tries detected sprite rows/frames first, then falls back to grid slicing",
+    )
+    parser.add_argument("--detect-background-threshold", type=float, default=64.0)
+    parser.add_argument("--detect-row-threshold", type=int, default=150)
+    parser.add_argument("--detect-row-merge-gap", type=int, default=8)
+    parser.add_argument(
+        "--detect-x-thresholds",
+        type=parse_thresholds,
+        default=parse_thresholds("20,35,60,80,120,150"),
+    )
+    parser.add_argument("--detect-x-merge-gap", type=int, default=36)
+    parser.add_argument("--detect-padding-x", type=int, default=30)
+    parser.add_argument("--detect-padding-y", type=int, default=8)
     parser.add_argument("--skip-contact-sheet", action="store_true")
     parser.add_argument("--skip-package", action="store_true")
     parser.add_argument("--force", action="store_true")
@@ -204,18 +410,63 @@ def main() -> None:
     if final_webp.exists() and not args.force:
         raise SystemExit(f"{final_webp} already exists; pass --force to overwrite")
 
-    atlas = normalize_source_atlas(source_atlas, background_threshold=args.background_threshold)
-    save_atlas(atlas, final_png, final_webp)
+    if args.normalization == "auto":
+        normalization_methods = ["detect", "grid"]
+    else:
+        normalization_methods = [args.normalization]
 
-    run(
-        [
-            sys.executable,
-            str(scripts_dir / "validate_atlas.py"),
-            str(final_webp),
-            "--json-out",
-            str(validation_path),
-        ]
-    )
+    selected_normalization = ""
+    normalization_report_path: Path | None = None
+    last_error = ""
+
+    for method in normalization_methods:
+        try:
+            if method == "detect":
+                atlas, normalization_report = normalize_detected_source_atlas(
+                    source_atlas,
+                    background_threshold=args.detect_background_threshold,
+                    row_threshold=args.detect_row_threshold,
+                    row_merge_gap=args.detect_row_merge_gap,
+                    x_thresholds=args.detect_x_thresholds,
+                    x_merge_gap=args.detect_x_merge_gap,
+                    padding_x=args.detect_padding_x,
+                    padding_y=args.detect_padding_y,
+                )
+            else:
+                atlas, normalization_report = normalize_grid_source_atlas(
+                    source_atlas,
+                    background_threshold=args.background_threshold,
+                )
+            save_atlas(atlas, final_png, final_webp)
+            qa_dir.mkdir(parents=True, exist_ok=True)
+            candidate_report_path = qa_dir / f"{method}-normalization-report.json"
+            candidate_report_path.write_text(
+                json.dumps(normalization_report, indent=2) + "\n", encoding="utf-8"
+            )
+            validation = run(
+                [
+                    sys.executable,
+                    str(scripts_dir / "validate_atlas.py"),
+                    str(final_webp),
+                    "--json-out",
+                    str(validation_path),
+                ],
+                check=False,
+            )
+            if validation.returncode == 0:
+                selected_normalization = method
+                normalization_report_path = candidate_report_path
+                break
+            last_error = (
+                f"{method} normalization produced an invalid atlas; "
+                f"see {validation_path}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"{method} normalization failed: {exc}"
+            print(last_error, file=sys.stderr)
+
+    if not selected_normalization:
+        raise SystemExit(last_error or "could not normalize source atlas")
 
     if not args.skip_contact_sheet:
         run(
@@ -255,10 +506,14 @@ def main() -> None:
     summary = {
         "ok": True,
         "mode": "fast-single-atlas",
+        "normalization": selected_normalization,
         "run_dir": str(run_dir),
         "source_atlas": str(source_atlas),
         "spritesheet": str(final_webp),
         "validation": str(validation_path),
+        "normalization_report": None
+        if normalization_report_path is None
+        else str(normalization_report_path),
         "contact_sheet": None if args.skip_contact_sheet else str(contact_sheet),
         "package": None if args.skip_package else str(package_dir),
     }
